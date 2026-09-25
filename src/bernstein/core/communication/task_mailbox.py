@@ -482,10 +482,15 @@ class TaskMailbox:
         acting = acting_task_id or task_id
         if not trusted_internal and allowed and acting not in allowed:
             raise MailboxAuthorizationError("acting task is not in this agent's task scope")
-        if not trusted_internal and task_id == acting and kind not in {
-            RENDEZVOUS_OPEN_KIND,
-            RENDEZVOUS_CLOSED_KIND,
-        }:
+        if (
+            not trusted_internal
+            and task_id == acting
+            and kind
+            not in {
+                RENDEZVOUS_OPEN_KIND,
+                RENDEZVOUS_CLOSED_KIND,
+            }
+        ):
             return
         if kind == "question":
             # #3450: this is the narrow compatibility boundary for both the

@@ -133,11 +133,16 @@ async def post_task_message(task_id: str, body: TaskMessagePost, request: Reques
         if body.sender != sender:
             raise HTTPException(status_code=403, detail="mailbox sender must match the authenticated agent identity")
         authorized_task_ids = list(agent_identity.task_ids)
-        if authorized_task_ids and task_id not in authorized_task_ids and body.kind not in {
-            "question",
-            RENDEZVOUS_OPEN_KIND,
-            RENDEZVOUS_CLOSED_KIND,
-        }:
+        if (
+            authorized_task_ids
+            and task_id not in authorized_task_ids
+            and body.kind
+            not in {
+                "question",
+                RENDEZVOUS_OPEN_KIND,
+                RENDEZVOUS_CLOSED_KIND,
+            }
+        ):
             raise HTTPException(status_code=403, detail=f"cross-task message kind {body.kind!r} is not permitted")
 
     task = _get_store(request).get_task(task_id)
