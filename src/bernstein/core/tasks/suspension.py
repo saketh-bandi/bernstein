@@ -167,10 +167,24 @@ async def blocking_ask(
     if on_post is not None:
         on_post(open_entry)
 
-    resume_status = await task_store.suspend_for_rendezvous(task_id, open_entry.entry_hash)
+    suspension = asyncio.create_task(task_store.suspend_for_rendezvous(task_id, open_entry.entry_hash))
+    try:
+        resume_status = await asyncio.shield(suspension)
+    except asyncio.CancelledError:
+        # The store mutates and then durably appends under its lock.  If the
+        # request is cancelled in that await, let the append settle before
+        # restoring the live claim so no persisted SUSPENDED row is stranded.
+        resume_status = await suspension
+        await task_store.recover_rendezvous_wait(
+            task_id,
+            resume_status=resume_status,
+            open_entry_hash=open_entry.entry_hash,
+        )
+        raise
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
     close_entry_hash = ""
+    recovered_without_close = False
     try:
         while True:
             for message in mailbox.all_messages():
@@ -206,6 +220,16 @@ async def blocking_ask(
                     on_post(timeout_close)
                 raise TimeoutError(f"blocking ask to task {awaited_task_id!r} timed out")
             await asyncio.sleep(poll_interval_s)
+    except asyncio.CancelledError:
+        # Cancellation has been delivered and caught, so the recovery write
+        # can complete before the same cancellation is propagated outward.
+        await task_store.recover_rendezvous_wait(
+            task_id,
+            resume_status=resume_status,
+            open_entry_hash=open_entry.entry_hash,
+        )
+        recovered_without_close = True
+        raise
     finally:
         # A close produced by the timeout path is appended synchronously; a
         # reply/refusal close was observed above.  The chain entry, rather
@@ -215,6 +239,16 @@ async def blocking_ask(
                 task_id,
                 resume_status=resume_status,
                 close_entry_hash=close_entry_hash,
+            )
+        elif not recovered_without_close:
+            # Cancellation or a local failure (for example MailboxFull while
+            # appending the timeout close) is not a semantic resolution.  Do
+            # not fabricate a close: restore the live claim while leaving the
+            # durable open unresolved for later inspection/replay.
+            await task_store.recover_rendezvous_wait(
+                task_id,
+                resume_status=resume_status,
+                open_entry_hash=open_entry.entry_hash,
             )
 
 

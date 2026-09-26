@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -14,7 +14,7 @@ from bernstein.core.communication.rendezvous import (
     encode_close_body,
     encode_open_body,
 )
-from bernstein.core.communication.task_mailbox import MailboxAuthorizationError, TaskMailbox
+from bernstein.core.communication.task_mailbox import MailboxAuthorizationError, MailboxFull, TaskMailbox
 from bernstein.core.server.server_models import TaskCreate
 from bernstein.core.tasks.models import TaskStatus
 from bernstein.core.tasks.suspension import blocking_ask, post_rendezvous_reply
@@ -84,6 +84,108 @@ async def test_answered_ask_suspends_then_resumes_with_the_stored_answer_bytes(t
     assert store.list_tasks(status="suspended") == []
     assert close.seq > reply.seq > open_message.seq
     assert mailbox.message_by_hash(reply.entry_hash) is reply
+
+
+@pytest.mark.asyncio
+async def test_failed_timeout_close_restores_task_without_fabricating_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mailbox = _mailbox(tmp_path)
+    store = TaskStore(tmp_path / "tasks.jsonl")
+    waiter = await store.create(TaskCreate(title="A", description="ask B", role="backend"))
+    waiter = await store.claim_by_id(waiter.id)
+    original_post = mailbox.post
+
+    def fail_timeout_close(**kwargs: Any) -> Any:
+        if kwargs["task_id"] == waiter.id and kwargs["kind"] == RENDEZVOUS_CLOSED_KIND:
+            raise MailboxFull("waiter mailbox is full")
+        return original_post(**kwargs)
+
+    monkeypatch.setattr(mailbox, "post", fail_timeout_close)
+
+    with pytest.raises(MailboxFull, match="waiter mailbox is full"):
+        await blocking_ask(
+            task_store=store,
+            task_id=waiter.id,
+            awaited_task_id="task-b",
+            question=b"Which schema should I use?",
+            mailbox=mailbox,
+            sender="session-a",
+            authorized_task_ids=[waiter.id],
+            timeout_s=0,
+            poll_interval_s=0.001,
+        )
+
+    assert _stored_status(store, waiter.id) is TaskStatus.CLAIMED
+    assert not any(message.kind == RENDEZVOUS_CLOSED_KIND for message in mailbox.all_messages())
+
+
+@pytest.mark.asyncio
+async def test_cancelled_live_wait_restores_task_without_fabricating_resolution(tmp_path: Path) -> None:
+    mailbox = _mailbox(tmp_path)
+    store = TaskStore(tmp_path / "tasks.jsonl")
+    waiter = await store.create(TaskCreate(title="A", description="ask B", role="backend"))
+    waiter = await store.claim_by_id(waiter.id)
+    waiting = asyncio.create_task(
+        blocking_ask(
+            task_store=store,
+            task_id=waiter.id,
+            awaited_task_id="task-b",
+            question=b"Which schema should I use?",
+            mailbox=mailbox,
+            sender="session-a",
+            authorized_task_ids=[waiter.id],
+            timeout_s=60,
+            poll_interval_s=0.001,
+        )
+    )
+
+    for _ in range(100):
+        if _stored_status(store, waiter.id) is TaskStatus.SUSPENDED:
+            break
+        await asyncio.sleep(0.001)
+    assert _stored_status(store, waiter.id) is TaskStatus.SUSPENDED
+
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+
+    assert _stored_status(store, waiter.id) is TaskStatus.CLAIMED
+    assert not any(message.kind == RENDEZVOUS_CLOSED_KIND for message in mailbox.all_messages())
+
+
+@pytest.mark.asyncio
+async def test_operator_can_cancel_a_stranded_cooperative_suspension(tmp_path: Path) -> None:
+    mailbox = _mailbox(tmp_path)
+    store = TaskStore(tmp_path / "tasks.jsonl")
+    waiter = await store.create(TaskCreate(title="A", description="ask B", role="backend"))
+    waiter = await store.claim_by_id(waiter.id)
+    question = mailbox.post(
+        task_id="task-b",
+        sender="session-a",
+        kind="question",
+        body="Which schema should I use?",
+        acting_task_id=waiter.id,
+        authorized_task_ids=[waiter.id],
+    )
+    opened = mailbox.post(
+        task_id="task-b",
+        sender="session-a",
+        kind=RENDEZVOUS_OPEN_KIND,
+        body=encode_open_body(
+            question_entry_hash=question.entry_hash,
+            waiter_task_id=waiter.id,
+            awaited_task_id="task-b",
+        ),
+        acting_task_id=waiter.id,
+        authorized_task_ids=[waiter.id],
+    )
+    await store.suspend_for_rendezvous(waiter.id, opened.entry_hash)
+
+    cancelled = await store.cancel(waiter.id, reason="operator recovery")
+
+    assert cancelled.status is TaskStatus.CANCELLED
+    assert not any(message.kind == RENDEZVOUS_CLOSED_KIND for message in mailbox.all_messages())
 
 
 def test_unauthorized_credential_cannot_open_another_tasks_wait(tmp_path: Path) -> None:

@@ -2978,6 +2978,49 @@ class TaskStore:
             self._notify_task_updated(task)
             return task
 
+    async def recover_rendezvous_wait(
+        self,
+        task_id: str,
+        *,
+        resume_status: TaskStatus,
+        open_entry_hash: str,
+    ) -> Task:
+        """Restore a cooperative waiter after its live wait exits abnormally.
+
+        No mailbox close is invented here.  The referenced open remains
+        unresolved in the authoritative mailbox chain; this transition only
+        prevents a cancelled or locally failed request from retaining the
+        task's live claim in ``SUSPENDED`` forever.
+        """
+        async with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                raise KeyError(task_id)
+            if task.status != TaskStatus.SUSPENDED:
+                raise ValueError(f"task {task_id!r} is not suspended")
+            if resume_status not in {TaskStatus.CLAIMED, TaskStatus.IN_PROGRESS}:
+                raise ValueError(f"invalid rendezvous recovery status {resume_status.value!r}")
+            self._index_remove(task)
+            if resume_status == TaskStatus.CLAIMED:
+                transition_task(
+                    task,
+                    TaskStatus.CLAIMED,
+                    actor="mailbox_rendezvous_recovery",
+                    reason=open_entry_hash,
+                )
+            elif resume_status == TaskStatus.IN_PROGRESS:
+                transition_task(
+                    task,
+                    TaskStatus.IN_PROGRESS,
+                    actor="mailbox_rendezvous_recovery",
+                    reason=open_entry_hash,
+                )
+            task.version += 1
+            self._index_add(task)
+            await self._append_jsonl(self._task_to_record(task))
+            self._notify_task_updated(task)
+            return task
+
     async def _complete_parent_if_ready(self, parent_task_id: str | None) -> None:
         """Complete a waiting ancestor chain when all descendant subtasks are done.
 
@@ -3132,6 +3175,7 @@ class TaskStore:
                 TaskStatus.IN_PROGRESS,
                 TaskStatus.BLOCKED,
                 TaskStatus.WAITING_FOR_SUBTASKS,
+                TaskStatus.SUSPENDED,
                 TaskStatus.PLANNED,
             }
             if task.status not in _cancellable:

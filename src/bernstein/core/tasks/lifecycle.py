@@ -179,6 +179,9 @@ TASK_TRANSITIONS: dict[tuple[TaskStatus, TaskStatus], Callable[[Task], bool]] = 
     # suspension; the live worker/session remains allocated throughout.
     (TaskStatus.SUSPENDED, TaskStatus.CLAIMED): _always,
     (TaskStatus.SUSPENDED, TaskStatus.IN_PROGRESS): _always,
+    # Operator escape hatch when a cooperative waiter cannot be recovered by
+    # its live request (for example process loss during cleanup).
+    (TaskStatus.SUSPENDED, TaskStatus.CANCELLED): _always,
     # Recovery from orphaned
     (TaskStatus.ORPHANED, TaskStatus.DONE): _always,
     (TaskStatus.ORPHANED, TaskStatus.FAILED): _always,
