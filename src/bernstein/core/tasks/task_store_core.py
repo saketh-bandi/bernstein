@@ -3310,6 +3310,7 @@ class TaskStore:
                 TaskStatus.IN_PROGRESS,
                 TaskStatus.BLOCKED,
                 TaskStatus.WAITING_FOR_SUBTASKS,
+                TaskStatus.SUSPENDED,
                 TaskStatus.PLANNED,
             }
             for tid in to_cancel:

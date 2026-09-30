@@ -332,12 +332,12 @@ def test_credential_not_scoped_to_waiter_cannot_post_rendezvous_open(tmp_path: A
     client, identities = _mailbox_app_with_agent_identity_store(tmp_path)
     _, token = identities.create_identity("session-c", "backend", task_ids=["task-c"])
     headers = {"Authorization": f"Bearer {token}"}
-    question = client.post(
-        "/tasks/task-b/messages",
-        headers=headers,
-        json={"sender": "session-c", "acting_task_id": "task-c", "kind": "question", "body": "question"},
+    question = client.app.state.task_mailbox.post(
+        task_id="task-b",
+        sender="session-c",
+        kind="question",
+        body="question",
     )
-    assert question.status_code == 201, question.text
 
     opened = client.post(
         "/tasks/task-b/messages",
@@ -347,7 +347,7 @@ def test_credential_not_scoped_to_waiter_cannot_post_rendezvous_open(tmp_path: A
             "acting_task_id": "task-a",
             "kind": "rendezvous_open",
             "body": encode_open_body(
-                question_entry_hash=question.json()["entry_hash"],
+                question_entry_hash=question.entry_hash,
                 waiter_task_id="task-a",
                 awaited_task_id="task-b",
             ),
@@ -356,6 +356,26 @@ def test_credential_not_scoped_to_waiter_cannot_post_rendezvous_open(tmp_path: A
 
     assert opened.status_code == 403
     assert "acting task" in opened.json()["detail"]
+
+
+def test_scoped_worker_cannot_post_unrelated_cross_task_question(tmp_path: Any) -> None:
+    """A bare question cannot use the rendezvous route exception."""
+    client, identities = _mailbox_app_with_agent_identity_store(tmp_path)
+    _, token = identities.create_identity("session-a", "backend", task_ids=["task-a"])
+
+    response = client.post(
+        "/tasks/task-b/messages",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "sender": "session-a",
+            "acting_task_id": "task-a",
+            "kind": "question",
+            "body": "unrelated question",
+        },
+    )
+
+    assert response.status_code == 403
+    assert "not permitted" in response.json()["detail"]
 
 
 def test_mailbox_exception_does_not_allow_unrelated_cross_task_kind(tmp_path: Any) -> None:

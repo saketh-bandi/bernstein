@@ -267,42 +267,17 @@ def post_rendezvous_reply(
     this one helper.  That compatibility choice is intentionally localized
     while #3450 settles whether the mailbox vocabulary should name replies.
     """
-    from bernstein.core.communication.rendezvous import (
-        RENDEZVOUS_CLOSED_KIND,
-        RENDEZVOUS_OPEN_KIND,
-        RendezvousOpen,
-        encode_close_body,
-    )
-
-    open_message = mailbox.message_by_hash(open_entry_hash)
-    if open_message is None or open_message.kind != RENDEZVOUS_OPEN_KIND:
-        raise ValueError("reply references no rendezvous open entry")
-    opened = RendezvousOpen.from_message(open_message)
     try:
         answer_text = answer.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError("rendezvous answer must be UTF-8") from exc
-    reply = mailbox.post(
-        task_id=opened.waiter_task_id,
+    return mailbox.post_rendezvous_reply(
+        open_entry_hash=open_entry_hash,
+        answer=answer_text,
         sender=sender,
-        kind="question",
-        body=answer_text,
         acting_task_id=acting_task_id,
         authorized_task_ids=authorized_task_ids,
     )
-    close = mailbox.post(
-        task_id=opened.waiter_task_id,
-        sender=sender,
-        kind=RENDEZVOUS_CLOSED_KIND,
-        body=encode_close_body(
-            open_entry_hash=open_entry_hash,
-            reply_entry_hash=reply.entry_hash,
-            resolution="answered",
-        ),
-        acting_task_id=acting_task_id,
-        authorized_task_ids=authorized_task_ids,
-    )
-    return reply, close
 
 
 # ---------------------------------------------------------------------------

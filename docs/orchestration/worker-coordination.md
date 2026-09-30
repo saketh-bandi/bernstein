@@ -107,14 +107,16 @@ scope as every other per-task write. The credential decides the reach:
 | Agent JWT scoped to specific tasks | its own task mailboxes, plus the validated question/rendezvous exchange described below |
 
 A task-scoped agent still receives `403` for every unrelated cross-task
-message and endpoint. The narrow exception is a blocking ask: task A may
-append a `question` and `rendezvous_open` to B, and B may append the reply
-entry and `rendezvous_closed` to A. The request names `acting_task_id`; the
-server verifies that task against the signed JWT `task_ids` claim, replaces
-the supplied sender with the authenticated agent identity, and validates
-each open/close against the entries it references. A batch credential must
-therefore say which one of its authorized tasks is acting, without gaining
-authority over any other message kind or task route.
+message and endpoint, including a bare `question` sent through the generic
+mailbox route. The narrow exception is the blocking-ask protocol: task A uses
+the `/ask` route to append a `question` and `rendezvous_open` to B, and B uses
+the `/rendezvous/reply` route to append the reply entry and
+`rendezvous_closed` to A. The server verifies the acting task against the
+signed JWT `task_ids` claim, replaces the supplied sender with the
+authenticated agent identity, and validates each open/close against the
+entries it references. A batch credential must therefore say which one of its
+authorized tasks is acting, without gaining authority over any other message
+kind or task route.
 
 The open/close pair is the durable record that A waited and how the wait
 ended. While the live request waits, A moves cooperatively from `CLAIMED` or
@@ -127,8 +129,8 @@ The worker-facing path is `POST /tasks/<waiter-id>/ask`. It keeps that HTTP
 request open while the waiter is cooperatively suspended. The awaited worker
 answers with `POST /tasks/<awaited-id>/rendezvous/reply`, naming the open entry
 it received in its mailbox. Both routes derive the acting task from the
-task-scoped credential and route, while the lower-level mailbox endpoint keeps
-`acting_task_id` for clients that append the protocol records directly.
+task-scoped credential and route. The generic mailbox endpoint does not accept
+a cross-task question as a substitute for either validated protocol route.
 
 Cooperative suspension is intentional here: keeping the live invocation lets
 `ask` return the recorded answer directly. Removing the task from scheduler

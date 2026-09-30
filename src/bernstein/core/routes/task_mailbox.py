@@ -138,7 +138,6 @@ async def post_task_message(task_id: str, body: TaskMessagePost, request: Reques
             and task_id not in authorized_task_ids
             and body.kind
             not in {
-                "question",
                 RENDEZVOUS_OPEN_KIND,
                 RENDEZVOUS_CLOSED_KIND,
             }

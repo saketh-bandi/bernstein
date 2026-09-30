@@ -41,6 +41,7 @@ from bernstein.core.communication.rendezvous import (
     RENDEZVOUS_OPEN_KIND,
     RendezvousClose,
     RendezvousOpen,
+    encode_close_body,
 )
 from bernstein.core.security.redactor import redact_text
 from bernstein.core.security.sanitize import sanitize_log
@@ -281,7 +282,9 @@ class TaskMailbox:
         self._path = path
         self._hmac_key = hmac_key
         self._identity_dir = identity_dir
-        self._lock = threading.Lock()
+        # Reply + close is one protocol transaction and reuses ``post`` while
+        # holding this lock, so same-thread re-entry must remain atomic.
+        self._lock = threading.RLock()
         self._messages: list[MailboxMessage] = []
         self._load_problems: list[str] = []
         self._consumed_seqs: dict[str, int] = {}
@@ -576,6 +579,68 @@ class TaskMailbox:
         if trusted_internal:
             return
         raise MailboxAuthorizationError(f"cross-task message kind {kind!r} is not permitted")
+
+    def post_rendezvous_reply(
+        self,
+        *,
+        open_entry_hash: str,
+        answer: str,
+        sender: str,
+        acting_task_id: str,
+        authorized_task_ids: Sequence[str],
+    ) -> tuple[MailboxMessage, MailboxMessage]:
+        """Atomically validate an open wait, then append its reply and close."""
+        with self._lock:
+            open_message = self.message_by_hash(open_entry_hash)
+            if open_message is None or open_message.kind != RENDEZVOUS_OPEN_KIND:
+                raise ValueError("reply references no rendezvous open entry")
+            opened = RendezvousOpen.from_message(open_message)
+            allowed = set(authorized_task_ids)
+            if allowed and acting_task_id not in allowed:
+                raise MailboxAuthorizationError("acting task is not in this agent's task scope")
+            if acting_task_id != opened.awaited_task_id:
+                raise MailboxAuthorizationError("only the awaited task may reply to this rendezvous")
+
+            for message in self._messages:
+                if message.kind != RENDEZVOUS_CLOSED_KIND:
+                    continue
+                try:
+                    closed = RendezvousClose.from_message(message)
+                except ValueError:
+                    continue
+                if closed.open_entry_hash == open_entry_hash:
+                    raise MailboxAuthorizationError("rendezvous is already closed")
+
+            consumed_cursor = self._consumed_seqs.get(opened.waiter_task_id, -1)
+            unconsumed_count = sum(
+                1
+                for message in self._messages
+                if message.task_id == opened.waiter_task_id and message.seq > consumed_cursor
+            )
+            if unconsumed_count > MAX_PENDING_PER_TASK - 2:
+                raise MailboxFull("rendezvous reply and close require two available mailbox slots")
+
+            reply = self.post(
+                task_id=opened.waiter_task_id,
+                sender=sender,
+                kind="question",
+                body=answer,
+                acting_task_id=acting_task_id,
+                authorized_task_ids=authorized_task_ids,
+            )
+            close = self.post(
+                task_id=opened.waiter_task_id,
+                sender=sender,
+                kind=RENDEZVOUS_CLOSED_KIND,
+                body=encode_close_body(
+                    open_entry_hash=open_entry_hash,
+                    reply_entry_hash=reply.entry_hash,
+                    resolution="answered",
+                ),
+                acting_task_id=acting_task_id,
+                authorized_task_ids=authorized_task_ids,
+            )
+            return reply, close
 
     def _append(self, message: MailboxMessage) -> None:
         """Durably append one journal row."""

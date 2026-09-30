@@ -10,6 +10,7 @@ import pytest
 from bernstein.core.communication.rendezvous import (
     RENDEZVOUS_CLOSED_KIND,
     RENDEZVOUS_OPEN_KIND,
+    RendezvousClose,
     RendezvousOpen,
     encode_close_body,
     encode_open_body,
@@ -17,7 +18,7 @@ from bernstein.core.communication.rendezvous import (
 from bernstein.core.communication.task_mailbox import MailboxAuthorizationError, MailboxFull, TaskMailbox
 from bernstein.core.server.server_models import TaskCreate
 from bernstein.core.tasks.models import TaskStatus
-from bernstein.core.tasks.suspension import blocking_ask, post_rendezvous_reply
+from bernstein.core.tasks.suspension import RendezvousRefusedError, blocking_ask, post_rendezvous_reply
 from bernstein.core.tasks.task_store import TaskStore
 
 if TYPE_CHECKING:
@@ -118,6 +119,83 @@ async def test_failed_timeout_close_restores_task_without_fabricating_resolution
 
     assert _stored_status(store, waiter.id) is TaskStatus.CLAIMED
     assert not any(message.kind == RENDEZVOUS_CLOSED_KIND for message in mailbox.all_messages())
+
+
+@pytest.mark.asyncio
+async def test_successful_timeout_records_close_and_restores_task(tmp_path: Path) -> None:
+    mailbox = _mailbox(tmp_path)
+    store = TaskStore(tmp_path / "tasks.jsonl")
+    waiter = await store.create(TaskCreate(title="A", description="ask B", role="backend"))
+    waiter = await store.claim_by_id(waiter.id)
+
+    with pytest.raises(TimeoutError, match="timed out"):
+        await blocking_ask(
+            task_store=store,
+            task_id=waiter.id,
+            awaited_task_id="task-b",
+            question=b"Which schema should I use?",
+            mailbox=mailbox,
+            sender="session-a",
+            authorized_task_ids=[waiter.id],
+            timeout_s=0,
+            poll_interval_s=0.001,
+        )
+
+    closes = [
+        RendezvousClose.from_message(message)
+        for message in mailbox.all_messages()
+        if message.kind == RENDEZVOUS_CLOSED_KIND
+    ]
+    assert len(closes) == 1
+    assert closes[0].resolution == "timeout"
+    assert closes[0].reply_entry_hash == ""
+    assert _stored_status(store, waiter.id) is TaskStatus.CLAIMED
+
+
+@pytest.mark.asyncio
+async def test_refused_resolution_restores_task_and_raises(tmp_path: Path) -> None:
+    mailbox = _mailbox(tmp_path)
+    store = TaskStore(tmp_path / "tasks.jsonl")
+    waiter = await store.create(TaskCreate(title="A", description="ask B", role="backend"))
+    waiter = await store.claim_by_id(waiter.id)
+    waiting = asyncio.create_task(
+        blocking_ask(
+            task_store=store,
+            task_id=waiter.id,
+            awaited_task_id="task-b",
+            question=b"Which schema should I use?",
+            mailbox=mailbox,
+            sender="session-a",
+            authorized_task_ids=[waiter.id],
+            timeout_s=2,
+            poll_interval_s=0.001,
+        )
+    )
+
+    opened = None
+    for _ in range(100):
+        opened = next((message for message in mailbox.all_messages() if message.kind == RENDEZVOUS_OPEN_KIND), None)
+        if opened is not None and _stored_status(store, waiter.id) is TaskStatus.SUSPENDED:
+            break
+        await asyncio.sleep(0.001)
+    assert opened is not None
+
+    mailbox.post(
+        task_id=waiter.id,
+        sender="session-b",
+        kind=RENDEZVOUS_CLOSED_KIND,
+        body=encode_close_body(
+            open_entry_hash=opened.entry_hash,
+            reply_entry_hash="",
+            resolution="refused",
+        ),
+        acting_task_id="task-b",
+        authorized_task_ids=["task-b"],
+    )
+
+    with pytest.raises(RendezvousRefusedError, match="refused"):
+        await waiting
+    assert _stored_status(store, waiter.id) is TaskStatus.CLAIMED
 
 
 @pytest.mark.asyncio
@@ -236,28 +314,64 @@ def test_only_the_awaited_task_can_close_an_answered_wait(tmp_path: Path) -> Non
         acting_task_id="task-a",
         authorized_task_ids=["task-a"],
     )
-    forged_reply = mailbox.post(
-        task_id="task-a",
-        sender="session-c",
-        kind="question",
-        body="forged answer",
-        acting_task_id="task-c",
-        authorized_task_ids=["task-c"],
-    )
+    messages_before = mailbox.all_messages()
 
-    with pytest.raises(MailboxAuthorizationError, match="may not close"):
-        mailbox.post(
-            task_id="task-a",
+    with pytest.raises(MailboxAuthorizationError, match="only the awaited task"):
+        post_rendezvous_reply(
+            mailbox=mailbox,
+            open_entry_hash=opened.entry_hash,
+            answer=b"forged answer",
             sender="session-c",
-            kind=RENDEZVOUS_CLOSED_KIND,
-            body=encode_close_body(
-                open_entry_hash=opened.entry_hash,
-                reply_entry_hash=forged_reply.entry_hash,
-                resolution="answered",
-            ),
             acting_task_id="task-c",
             authorized_task_ids=["task-c"],
         )
+
+    assert mailbox.all_messages() == messages_before
+
+
+def test_second_reply_is_rejected_without_appending_a_stray_entry(tmp_path: Path) -> None:
+    mailbox = _mailbox(tmp_path)
+    question = mailbox.post(
+        task_id="task-b",
+        sender="session-a",
+        kind="question",
+        body="question",
+        acting_task_id="task-a",
+        authorized_task_ids=["task-a"],
+    )
+    opened = mailbox.post(
+        task_id="task-b",
+        sender="session-a",
+        kind=RENDEZVOUS_OPEN_KIND,
+        body=encode_open_body(
+            question_entry_hash=question.entry_hash,
+            waiter_task_id="task-a",
+            awaited_task_id="task-b",
+        ),
+        acting_task_id="task-a",
+        authorized_task_ids=["task-a"],
+    )
+    post_rendezvous_reply(
+        mailbox=mailbox,
+        open_entry_hash=opened.entry_hash,
+        answer=b"first answer",
+        sender="session-b",
+        acting_task_id="task-b",
+        authorized_task_ids=["task-b"],
+    )
+    messages_before = mailbox.all_messages()
+
+    with pytest.raises(MailboxAuthorizationError, match="already closed"):
+        post_rendezvous_reply(
+            mailbox=mailbox,
+            open_entry_hash=opened.entry_hash,
+            answer=b"second answer",
+            sender="session-b",
+            acting_task_id="task-b",
+            authorized_task_ids=["task-b"],
+        )
+
+    assert mailbox.all_messages() == messages_before
 
 
 def test_unrelated_cross_task_message_kind_remains_forbidden(tmp_path: Path) -> None:
