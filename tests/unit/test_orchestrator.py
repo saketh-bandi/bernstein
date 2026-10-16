@@ -42,6 +42,9 @@ from bernstein.core.spawner import AgentSpawner
 from bernstein.core.tick_pipeline import prioritize_starving_roles
 
 from bernstein.adapters.base import CLIAdapter, SpawnResult
+from bernstein.core.communication.deadlock_receipt import emit_deadlock_receipt
+from bernstein.core.communication.rendezvous import RENDEZVOUS_OPEN_KIND, encode_open_body
+from bernstein.core.communication.task_mailbox import TaskMailbox
 from bernstein.core.security.audit_chain import AuditChainStore
 from bernstein.core.security.run_closure import RunClosureOutcome, RunClosureStatus, project_run_closure
 
@@ -1173,6 +1176,79 @@ class TestOrchestratorTick:
 
         assert len(result.errors) == 1
         assert "fetch_all" in result.errors[0]
+
+    def test_tick_checks_durable_mailbox_for_rendezvous_deadlocks(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Repeated ticks persist one receipt for the same durable cycle."""
+        monkeypatch.setenv("BERNSTEIN_CONFIDENCE_DB", str(tmp_path / "confidence.db"))
+        transport = _mock_transport({"GET /tasks": httpx.Response(200, json=[])})
+        orch = _build_orchestrator(tmp_path, transport)
+        mailbox = TaskMailbox(
+            tmp_path / ".sdd" / "runtime" / "mailbox.jsonl",
+            hmac_key=b"deadlock-test-key",
+            identity_dir=tmp_path / ".sdd" / "identity",
+        )
+        question_a = mailbox.post(task_id="task-b", sender="worker-a", kind="question", body="ask b")
+        mailbox.post(
+            task_id="task-b",
+            sender="worker-a",
+            kind=RENDEZVOUS_OPEN_KIND,
+            body=encode_open_body(
+                question_entry_hash=question_a.entry_hash,
+                waiter_task_id="task-a",
+                awaited_task_id="task-b",
+            ),
+        )
+        question_b = mailbox.post(task_id="task-a", sender="worker-b", kind="question", body="ask a")
+        mailbox.post(
+            task_id="task-a",
+            sender="worker-b",
+            kind=RENDEZVOUS_OPEN_KIND,
+            body=encode_open_body(
+                question_entry_hash=question_b.entry_hash,
+                waiter_task_id="task-b",
+                awaited_task_id="task-a",
+            ),
+        )
+
+        with patch(
+            "bernstein.core.communication.deadlock_receipt.emit_deadlock_receipt",
+            wraps=emit_deadlock_receipt,
+        ) as emit:
+            orch.tick()
+            orch.tick()
+
+        receipts = list((tmp_path / ".sdd" / "runtime" / "deadlock-receipts").glob("*.json"))
+        assert len(receipts) == 1
+        assert emit.call_count == 1
+
+    def test_tick_retries_deadlock_receipt_after_emission_failure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A transient receipt failure must not mark the mailbox as processed."""
+        monkeypatch.setenv("BERNSTEIN_CONFIDENCE_DB", str(tmp_path / "confidence.db"))
+        transport = _mock_transport({"GET /tasks": httpx.Response(200, json=[])})
+        orch = _build_orchestrator(tmp_path, transport)
+        mailbox = TaskMailbox(
+            tmp_path / ".sdd" / "runtime" / "mailbox.jsonl",
+            hmac_key=b"deadlock-test-key",
+            identity_dir=tmp_path / ".sdd" / "identity",
+        )
+        mailbox.post(task_id="task-b", sender="worker-a", kind="question", body="ask b")
+
+        with patch(
+            "bernstein.core.communication.deadlock_receipt.emit_deadlock_receipt",
+            side_effect=OSError("transient write failure"),
+        ) as emit:
+            orch.tick()
+            orch.tick()
+
+        assert emit.call_count == 2
 
     def test_tracks_agents_across_ticks(self, tmp_path: Path) -> None:
         tasks_tick1 = [_make_task(id="T-1")]
