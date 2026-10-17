@@ -1285,7 +1285,9 @@ class TestOrchestratorTick:
             orch.tick()
 
         emit.assert_not_called()
-        failures = [record.message for record in caplog.records if "mailbox chain verification failed" in record.message]
+        failures = [
+            record.message for record in caplog.records if "mailbox chain verification failed" in record.message
+        ]
         assert len(failures) == 1
         assert "entry hash mismatch" in failures[0]
 
@@ -1321,7 +1323,9 @@ class TestOrchestratorTick:
             restarted_orchestrator.tick()
             assert emit.call_count == 2
 
-        failures = [record.message for record in caplog.records if "existing deadlock receipt is invalid JSON" in record.message]
+        failures = [
+            record.message for record in caplog.records if "existing deadlock receipt is invalid JSON" in record.message
+        ]
         assert len(failures) == 1
         repaired = json.loads(receipt_path.read_text(encoding="utf-8"))
         assert verify_receipt(repaired).ok is True
