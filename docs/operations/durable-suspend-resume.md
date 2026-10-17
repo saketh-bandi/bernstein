@@ -51,7 +51,11 @@ The receipt path is content-addressed by the canonical cycle and its open-entry
 hashes. That makes repeated ticks and orchestrator restarts idempotent: the same
 deadlock is recorded once, while a later cycle formed by new opens is a distinct
 incident. Closing either wait removes its graph edge and prevents a receipt for
-that cycle. Detection and recording are observational only; this slice does not
+that cycle. A parallel open on an existing cycle edge changes the supporting
+evidence and therefore mints a follow-up receipt for that incident. Detection
+uses the existing single-result `find_cycle()` helper: when independent cycles
+coexist, only its deterministically named cycle is receipted until that cycle
+resolves. Detection and recording are observational only; this slice does not
 cancel tasks, append a close, or resolve the cycle automatically.
 
 ## The park is a receipt, not a flag

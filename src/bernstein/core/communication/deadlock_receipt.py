@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 __all__ = [
     "DEADLOCK_RECEIPT_SCHEMA_VERSION",
     "RECEIPT_KIND",
+    "CorruptDeadlockReceiptError",
     "DeadlockReceiptResult",
     "build_deadlock_payload",
     "deadlock_payload_errors",
@@ -48,6 +49,14 @@ DEADLOCK_RECEIPT_SCHEMA_VERSION = "rendezvous-deadlock/v1"
 _RECEIPT_SUBPATH = ("runtime", "deadlock-receipts")
 _PRIVATE_KEY_NAME = "deadlock_receipt_signing.pem"
 _PUBLIC_KEY_NAME = "deadlock_receipt_signing.pub"
+
+
+class CorruptDeadlockReceiptError(ValueError):
+    """An existing content-addressed receipt cannot be trusted or reused."""
+
+    def __init__(self, message: str, *, path: Path) -> None:
+        super().__init__(message)
+        self.path = path
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,19 +168,24 @@ def _receipt_path(sdd_dir: Path, cycle_id: str) -> Path:
 def _load_existing(path: Path, expected_payload: Mapping[str, Any]) -> ReceiptEnvelope:
     try:
         raw_object: object = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"existing deadlock receipt is unreadable: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise CorruptDeadlockReceiptError(f"existing deadlock receipt is invalid JSON: {path}", path=path) from exc
+    except UnicodeDecodeError as exc:
+        raise CorruptDeadlockReceiptError(f"existing deadlock receipt is invalid UTF-8: {path}", path=path) from exc
     if not isinstance(raw_object, dict):
-        raise ValueError(f"existing deadlock receipt is not an object: {path}")
+        raise CorruptDeadlockReceiptError(f"existing deadlock receipt is not an object: {path}", path=path)
     raw = cast("dict[str, object]", raw_object)
     verification = verify_receipt(raw)
     if not verification.ok:
-        raise ValueError(f"existing deadlock receipt does not verify: {path}")
+        raise CorruptDeadlockReceiptError(f"existing deadlock receipt does not verify: {path}", path=path)
     if raw.get("kind") != RECEIPT_KIND:
-        raise ValueError(f"existing deadlock receipt has the wrong kind: {path}")
+        raise CorruptDeadlockReceiptError(f"existing deadlock receipt has the wrong kind: {path}", path=path)
     payload: object = raw.get("payload")
     if payload != dict(expected_payload):
-        raise ValueError(f"existing deadlock receipt payload disagrees with cycle identity: {path}")
+        raise CorruptDeadlockReceiptError(
+            f"existing deadlock receipt payload disagrees with cycle identity: {path}",
+            path=path,
+        )
     return ReceiptEnvelope(
         kind=str(raw["kind"]),
         payload=cast("dict[str, Any]", payload),

@@ -514,8 +514,12 @@ class Orchestrator:
         self._progress_stall_stopped: bool = False
         # A mailbox append changes its size.  Cache that durable state so the
         # deadlock fold does not replay the full chain on every unchanged tick.
-        # Failures deliberately leave this unset so the next tick retries.
+        # Transient failures deliberately leave this unset so the next tick retries.
         self._deadlock_mailbox_state: tuple[int, int] | None = None
+        # A corrupt persisted receipt is deterministic for a mailbox snapshot.
+        # Remember its own file state as well, so unchanged corruption logs
+        # once while an operator repair retries without requiring a new message.
+        self._deadlock_corrupt_receipt_state: tuple[tuple[int, int], Path, tuple[int, int, int] | None] | None = None
         self._cached_critical_path_ids: set[str] = set()
         self._dependency_scanner = DependencyVulnerabilityScanner(
             workdir,
@@ -1554,7 +1558,7 @@ class Orchestrator:
 
     def _record_rendezvous_deadlock(self) -> None:
         """Record the mailbox chain's deterministic wait cycle, if one exists."""
-        from bernstein.core.communication.deadlock_receipt import emit_deadlock_receipt
+        from bernstein.core.communication.deadlock_receipt import CorruptDeadlockReceiptError, emit_deadlock_receipt
         from bernstein.core.communication.task_mailbox import TaskMailbox
 
         mailbox_path = self._workdir / ".sdd" / "runtime" / "mailbox.jsonl"
@@ -1566,9 +1570,42 @@ class Orchestrator:
         if mailbox_state == self._deadlock_mailbox_state:
             return
 
-        mailbox = TaskMailbox(mailbox_path)
-        outcome = emit_deadlock_receipt(messages=mailbox.all_messages(), sdd_dir=self._workdir / ".sdd")
+        corrupt_state = self._deadlock_corrupt_receipt_state
+        if corrupt_state is not None and corrupt_state[0] == mailbox_state:
+            receipt_path = corrupt_state[1]
+            try:
+                receipt_stat = receipt_path.stat()
+                current_receipt_state: tuple[int, int, int] | None = (
+                    receipt_stat.st_mtime_ns,
+                    receipt_stat.st_ctime_ns,
+                    receipt_stat.st_size,
+                )
+            except FileNotFoundError:
+                current_receipt_state = None
+            if current_receipt_state == corrupt_state[2]:
+                return
+
+        mailbox = TaskMailbox(mailbox_path, hmac_key=load_or_create_audit_key())
+        mailbox_ok, mailbox_problems = mailbox.verify()
+        if not mailbox_ok:
+            self._deadlock_mailbox_state = mailbox_state
+            raise ValueError("mailbox chain verification failed: " + "; ".join(mailbox_problems))
+        try:
+            outcome = emit_deadlock_receipt(messages=mailbox.all_messages(), sdd_dir=self._workdir / ".sdd")
+        except CorruptDeadlockReceiptError as exc:
+            try:
+                receipt_stat = exc.path.stat()
+                receipt_state: tuple[int, int, int] | None = (
+                    receipt_stat.st_mtime_ns,
+                    receipt_stat.st_ctime_ns,
+                    receipt_stat.st_size,
+                )
+            except FileNotFoundError:
+                receipt_state = None
+            self._deadlock_corrupt_receipt_state = (mailbox_state, exc.path, receipt_state)
+            raise
         self._deadlock_mailbox_state = mailbox_state
+        self._deadlock_corrupt_receipt_state = None
         if outcome.emitted and outcome.receipt is not None:
             logger.warning(
                 "rendezvous deadlock recorded: cycle=%s receipt=%s",
@@ -1745,7 +1782,7 @@ class Orchestrator:
         try:
             self._record_rendezvous_deadlock()
         except Exception as exc:  # receipt evidence is best-effort; never stop scheduling
-            logger.warning("rendezvous deadlock receipt failed: %s", type(exc).__name__)
+            logger.warning("rendezvous deadlock receipt failed: %s", sanitize_log(str(exc)))
 
         # 0-pre. Proactive server health check (every normal tick).
         # Detects server crashes early so the watchdog can restart it

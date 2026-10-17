@@ -7,8 +7,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from bernstein.core.communication.deadlock_receipt import (
     RECEIPT_KIND,
+    CorruptDeadlockReceiptError,
+    DeadlockReceiptResult,
     build_deadlock_payload,
     emit_deadlock_receipt,
 )
@@ -120,12 +124,25 @@ def test_mutating_a_receipt_fails_shared_verification(tmp_path: Path) -> None:
     assert any("signature" in error for error in verification.errors)
 
 
+def test_corrupt_existing_receipt_raises_specific_error(tmp_path: Path) -> None:
+    """A persisted receipt that cannot verify is not a transient write error."""
+    sdd_dir = tmp_path / ".sdd"
+    first = emit_deadlock_receipt(messages=_two_task_cycle(), sdd_dir=sdd_dir)
+    assert first.path is not None
+    first.path.write_text("{", encoding="utf-8")
+
+    with pytest.raises(CorruptDeadlockReceiptError, match="invalid JSON") as raised:
+        emit_deadlock_receipt(messages=_two_task_cycle(), sdd_dir=sdd_dir)
+
+    assert raised.value.path == first.path
+
+
 def test_closing_one_wait_removes_the_edge_and_emits_no_receipt(tmp_path: Path) -> None:
     """A close bound to either cycle leg prevents a deadlock receipt."""
     entries = _two_task_cycle()
     entries.append(_close("hmac-sha256:open-b", seq=9))
     outcome = emit_deadlock_receipt(messages=entries, sdd_dir=tmp_path / ".sdd")
-    assert outcome == type(outcome)(receipt=None, path=None, emitted=False)
+    assert outcome == DeadlockReceiptResult(receipt=None, path=None, emitted=False)
     assert not (tmp_path / ".sdd" / "runtime" / "deadlock-receipts").exists()
 
 
